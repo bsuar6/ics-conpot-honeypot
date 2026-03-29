@@ -21,7 +21,7 @@ This lab uses **Conpot** — an open source ICS honeypot that impersonates real 
 Internet
     │
     ▼
-DigitalOcean Droplet 1 — Conpot Honeypot (68.183.111.107)
+DigitalOcean Droplet 1 — Conpot Honeypot (<HONEYPOT_IP>)
     │
     ├── Port 80   → HTTP (fake Siemens HMI web interface)
     ├── Port 102  → S7Comm (fake Siemens S7 PLC)
@@ -31,11 +31,11 @@ DigitalOcean Droplet 1 — Conpot Honeypot (68.183.111.107)
     │
     │  Wazuh agent (port 1514)
     ▼
-DigitalOcean Droplet 2 — Wazuh SIEM (147.182.245.31)
+DigitalOcean Droplet 2 — Wazuh SIEM (<WAZUH_IP>)
     │
     ├── Wazuh Manager — receives and analyzes logs
     ├── Wazuh Indexer — stores events (OpenSearch)
-    └── Wazuh Dashboard — web UI at https://147.182.245.31
+    └── Wazuh Dashboard — web UI at https://<WAZUH_IP>
 ```
 
 ---
@@ -59,7 +59,7 @@ Running a honeypot on a home network exposes personal devices and ISP-assigned I
 
 1. Log into **digitalocean.com** → **Create → Droplets**
 2. Configure:
-   - **Region:** New York
+   - **Region:** New York or closest region
    - **Image:** Ubuntu 24.04 LTS
    - **Size:** Basic → Regular → $6/month (1GB RAM)
    - **Authentication:** SSH key
@@ -67,7 +67,7 @@ Running a honeypot on a home network exposes personal devices and ISP-assigned I
 
 **Generate a dedicated SSH key — never reuse keys across projects:**
 ```bash
-ssh-keygen -t ed25519 -C "conpot-honeypot" -f ~/.ssh/conpot_key
+ssh-keygen -t ed25519 -C "conpot-honeypot" -f ~/.ssh/<your_key_name>
 ```
 
 - `-t ed25519` — modern elliptic curve algorithm, more secure than RSA
@@ -76,12 +76,12 @@ ssh-keygen -t ed25519 -C "conpot-honeypot" -f ~/.ssh/conpot_key
 
 Get the public key to paste into DigitalOcean:
 ```bash
-cat ~/.ssh/conpot_key.pub
+cat ~/.ssh/<your_key_name>.pub
 ```
 
 **Connect to the droplet:**
 ```bash
-ssh -i ~/.ssh/conpot_key root@68.183.111.107
+ssh -i ~/.ssh/<your_key_name> root@<HONEYPOT_IP>
 ```
 
 ---
@@ -148,14 +148,14 @@ docker run -d \
 
 **Why non-standard internal ports?** Conpot runs as a non-root user inside Docker and cannot bind to privileged ports (below 1024) directly. Docker handles the external-to-internal port mapping.
 
-**Verify connectivity from Mac:**
+**Verify connectivity:**
 ```bash
-nc -zv 68.183.111.107 502
+nc -zv <HONEYPOT_IP> 502
 ```
 
 Expected:
 ```
-Connection to 68.183.111.107 port 502 succeeded!
+Connection to <HONEYPOT_IP> port 502 succeeded!
 ```
 
 **Protocols simulated by Conpot:**
@@ -212,8 +212,6 @@ pip install flask requests --break-system-packages --ignore-installed
 ```
 
 ### Running as a Persistent Service
-
-Create a systemd service so the dashboard survives reboots:
 ```bash
 nano /etc/systemd/system/dashboard.service
 ```
@@ -238,7 +236,7 @@ systemctl enable dashboard
 systemctl start dashboard
 ```
 
-Access at: `http://68.183.111.107:8888`
+Access at: `http://<HONEYPOT_IP>:8888`
 
 ### Dashboard Features
 
@@ -257,7 +255,7 @@ Access at: `http://68.183.111.107:8888`
 
 ![HTTP Requests](screenshots/conpot_http_requests.png)
 
-*Recent HTTP requests table. IP `45.205.1.20` made 11 rapid sequential requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) — a framework-specific scanner that incorrectly fingerprinted the fake ICS HMI as a Node.js web application. This demonstrates how automated tools use technology-specific wordlists regardless of the actual target.*
+*Recent HTTP requests table. One IP made 11 rapid sequential requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) — a framework-specific scanner that incorrectly fingerprinted the fake ICS HMI as a Node.js web application. This demonstrates how automated tools use technology fingerprinting to select attack modules.*
 
 ---
 
@@ -272,10 +270,10 @@ Wazuh requires a minimum of 4GB RAM. Running it on the same droplet as Conpot wo
 **DigitalOcean → Create → Droplets:**
 - **Image:** Ubuntu 24.04 LTS
 - **Size:** $24/month (4GB RAM / 2 vCPUs) — minimum for Wazuh
-- **SSH key:** Same `conpot_key`
+- **SSH key:** Same `<your_key_name>`
 - **Hostname:** `wazuh-siem`
 ```bash
-ssh -i ~/.ssh/conpot_key root@147.182.245.31
+ssh -i ~/.ssh/<your_key_name> root@<WAZUH_IP>
 ```
 
 ### Step 2 — Install Wazuh
@@ -288,7 +286,7 @@ The `-i` flag bypasses the Ubuntu 24.04 compatibility check — Wazuh 4.7 works 
 
 **Save the generated credentials immediately** — they are only shown once.
 
-Access the dashboard at `https://147.182.245.31` with the generated admin credentials.
+Access the dashboard at `https://<WAZUH_IP>` with the generated admin credentials.
 
 ### Step 3 — Configure Wazuh Firewall
 
@@ -298,10 +296,10 @@ Name: `wazuh-firewall`
 
 | Type | Protocol | Port | Source |
 |------|----------|------|--------|
-| Custom | TCP | 1514 | 68.183.111.107 only |
-| Custom | TCP | 1515 | 68.183.111.107 only |
-| HTTPS | TCP | 443 | Your Mac IP |
-| SSH | TCP | 22 | Your Mac IP |
+| Custom | TCP | 1514 | `<HONEYPOT_IP>` only |
+| Custom | TCP | 1515 | `<HONEYPOT_IP>` only |
+| HTTPS | TCP | 443 | Your IP |
+| SSH | TCP | 22 | Your IP |
 
 **Why restrict 1514/1515 to the Conpot IP only?** These are Wazuh agent communication ports. Exposing them to the internet would allow anyone to register rogue agents with your SIEM manager.
 
@@ -323,11 +321,11 @@ wget https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/wazuh-agent_4.7.
 dpkg -i wazuh-agent_4.7.5-1_amd64.deb
 ```
 
-**Why version matching matters:** The Wazuh agent version must be equal to or lower than the manager version. Installing a newer agent (4.14.4 from the default repo) against a 4.7.5 manager causes authentication failures.
+**Why version matching matters:** The Wazuh agent version must be equal to or lower than the manager version. Installing a newer agent against an older manager causes authentication failures.
 
 **Configure the manager IP:**
 ```bash
-sed -i 's/MANAGER_IP/147.182.245.31/' /var/ossec/etc/ossec.conf
+sed -i 's/MANAGER_IP/<WAZUH_IP>/' /var/ossec/etc/ossec.conf
 systemctl enable wazuh-agent
 systemctl start wazuh-agent
 ```
@@ -362,8 +360,6 @@ systemctl restart wazuh-agent
 ```
 
 ### Step 6 — Enable Log Archives on Wazuh Manager
-
-SSH into the **Wazuh manager droplet** and enable full log archiving:
 ```bash
 sed -i 's/<logall>no<\/logall>/<logall>yes<\/logall>/' /var/ossec/etc/ossec.conf
 sed -i 's/<logall_json>no<\/logall_json>/<logall_json>yes<\/logall_json>/' /var/ossec/etc/ossec.conf
@@ -373,8 +369,6 @@ systemctl restart wazuh-manager
 Archives stored at: `/var/ossec/logs/archives/archives.log`
 
 ### Step 7 — Custom Conpot Decoder
-
-Create a decoder so Wazuh understands Conpot's log format:
 ```bash
 nano /var/ossec/etc/decoders/conpot_decoders.xml
 ```
@@ -405,8 +399,6 @@ nano /var/ossec/etc/decoders/conpot_decoders.xml
 ```bash
 echo "New http session from 159.223.216.61" | /var/ossec/bin/wazuh-logtest
 ```
-
-Expected output confirms decoder match and rule firing.
 
 ### Step 8 — Custom Detection Rules
 ```bash
@@ -441,7 +433,14 @@ nano /var/ossec/etc/rules/conpot_rules.xml
 
 ### Step 9 — False Positive Suppression
 
-Wazuh's rootcheck flagged `/bin/diff` and `/usr/bin/diff` as trojaned binaries. Investigation confirmed this was a false positive — both files had identical SHA256 hashes, matching timestamps, and are legitimate ELF binaries from the `diffutils` package. The signature match was a pattern overlap with Wazuh's generic trojan detection regex.
+Wazuh rootcheck flagged `/bin/diff` and `/usr/bin/diff` as trojaned binaries. Investigation confirmed this was a false positive — both files had identical SHA256 hashes, matching timestamps, and are legitimate ELF binaries from the `diffutils` package.
+
+**Investigation commands:**
+```bash
+sha256sum /bin/diff /usr/bin/diff
+file /bin/diff
+dpkg -S /usr/bin/diff
+```
 
 **Suppression rule:**
 ```bash
@@ -458,8 +457,6 @@ nano /var/ossec/etc/rules/local_rules.xml
 
 </group>
 ```
-
-Setting level to `0` suppresses the alert completely. This is standard SOC practice — investigating alerts, confirming false positives, and writing suppression rules to reduce noise is a core analyst workflow.
 ```bash
 systemctl restart wazuh-manager
 ```
@@ -481,11 +478,19 @@ A custom dashboard built in Wazuh's OpenSearch interface provides correlated thr
 
 **Index pattern:** `wazuh-alerts-*`
 
+**Build each visualization:**
+1. Wazuh Dashboard → OpenSearch Dashboards → Visualize → Create visualization
+2. Select chart type
+3. Index pattern: `wazuh-alerts-*`
+4. Configure buckets as shown in table above
+5. Save each visualization
+6. Dashboard → Create dashboard → Add all four visualizations
+
 ### Screenshot — Wazuh SIEM Dashboard
 
 ![Wazuh Dashboard](screenshots/wazuh_dashboard.png)
 
-*Custom "ICS Honeypot — Live Threat Dashboard" in Wazuh OpenSearch. Top left: bar chart showing `195.178.110.218` as the most active attacker. Top right: alerts over time line chart with burst peaking at 8 alerts per minute. Bottom left: rule distribution pie dominated by SSH brute force with secondary slices for Conpot sessions and system events. Bottom right: world map with attack concentration over Eastern Europe (Romania) and Western Europe (Netherlands).*
+*Custom "ICS Honeypot — Live Threat Dashboard" in Wazuh OpenSearch. Top left: bar chart of top attacking IPs. Top right: alerts over time with burst peaking at 8 alerts per minute. Bottom left: rule distribution pie dominated by SSH brute force with secondary slices for Conpot sessions. Bottom right: world map with attack concentration over Eastern Europe (Romania) and Western Europe (Netherlands).*
 
 ---
 
@@ -499,15 +504,11 @@ The honeypot received its first connection attempt within 30 minutes of deployme
 
 Connections to ports 502 (Modbus) and 102 (S7Comm) confirm ICS-specific scanning tools are active on the internet. Generic web scanners do not probe these ports — this traffic originates from tools purpose-built to find industrial systems.
 
-### Finding 3 — Coordinated Romanian Botnet — SSH Credential Stuffing
+**MITRE ATT&CK for ICS:** T0888 — Remote System Information Discovery
 
-**Source:** IP range `2.57.121.x` and `2.57.122.x` (Romania)
+### Finding 3 — Coordinated SSH Credential Stuffing
 
-A coordinated botnet making SSH brute force attempts every 90 seconds using a rotating wordlist of cryptocurrency-specific usernames:
-
-`solana`, `solv`, `validator`, `node`, `evm`, `evmbot`, `trader`, `trading`, `sniper`, `bot`, `ubuntu`
-
-This is a **crypto-targeting botnet** systematically scanning for exposed blockchain infrastructure. The username wordlist is specifically curated for Solana validators, EVM nodes, and crypto trading bots — not generic SSH brute force.
+A coordinated botnet making SSH brute force attempts every 90 seconds using a rotating wordlist of cryptocurrency-specific usernames: `solana`, `solv`, `validator`, `node`, `evm`, `evmbot`, `trader`, `trading`, `sniper`, `bot`. This is a crypto-targeting botnet scanning for exposed blockchain infrastructure.
 
 **MITRE ATT&CK:** T1110.001 — Password Guessing
 
@@ -518,57 +519,38 @@ X-Forwarded-For: 127.0.0.1
 User-Agent: Chrome/55 (2016 — spoofed)
 ```
 
-Scanner routing traffic through a Squid proxy chain and setting `X-Forwarded-For` to loopback to obscure true origin. Spoofed user agent mimics a 2016-era browser. This level of evasion indicates sophisticated automated tooling.
+Scanner routing traffic through a Squid proxy chain with spoofed loopback headers to obscure true origin. Indicates sophisticated automated tooling designed to evade attribution.
 
 **MITRE ATT&CK for ICS:** T0883 — Internet Accessible Device
 
 ### Finding 5 — Compromised Scanning Infrastructure
 
-IP `204.76.203.206` (pfcloud.network) was identified as running nginx 1.18.0 with multiple unpatched CVEs:
-- **CVE-2023-44487** — HTTP/2 Rapid Reset DDoS
-- **CVE-2025-23419** — 2025 nginx vulnerability
-- **CVE-2021-23017** — nginx DNS resolver
+A source IP was identified running nginx 1.18.0 with multiple unpatched CVEs including CVE-2023-44487 (HTTP/2 Rapid Reset) and a 2025 CVE — a compromised or rented host being used as scanning infrastructure to hide attacker identity.
 
-This is a compromised or rented host being used as scanning infrastructure — a common technique to hide attacker identity and distribute scanning load.
+### Finding 6 — Framework-Specific Scanner Misfiring
 
-### Finding 6 — Next.js Framework Scanner
-
-IP `45.205.1.20` made 11 rapid requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) against the fake ICS HMI. The scanner incorrectly fingerprinted the Conpot HTTP interface as a Node.js web application and switched to a framework-specific wordlist. This demonstrates how automated tools use technology fingerprinting to select attack modules.
+One IP made 11 rapid requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) against the fake ICS HMI — incorrectly fingerprinting Conpot as a Node.js application and switching to a framework-specific attack module.
 
 ### Finding 7 — False Positive Investigation
 
-Wazuh rootcheck flagged `/bin/diff` and `/usr/bin/diff` as trojaned binaries (rule 510, level 7). Full investigation:
-```bash
-sha256sum /bin/diff /usr/bin/diff
-# Both returned identical hashes — same file
-file /bin/diff
-# Confirmed legitimate ELF 64-bit binary
-dpkg -S /usr/bin/diff
-# Confirmed owned by diffutils package
-```
-
-**Verdict:** False positive. Wazuh's generic trojan signature `bash|^/bin/sh|file.h|proc.h` matched a string pattern inside the legitimate binary. Suppression rule written and documented.
+Wazuh rootcheck flagged `/bin/diff` as trojaned (rule 510, level 7). Full forensic investigation confirmed legitimate binary via SHA256 hash verification and package manifest check. Suppression rule written. This demonstrates a core SOC analyst workflow — alert triage, investigation, and noise reduction.
 
 ---
 
 ## Key Security Findings
 
-1. **Internet-exposed ICS devices are discovered within minutes** — automated tools sweep the entire IPv4 space continuously
-2. **Scanners actively evade detection** — proxy chaining, spoofed user agents, and manipulated headers indicate sophisticated tooling
-3. **Port 502 attracts ICS-specific tools** — not generic internet scanners
-4. **Compromised infrastructure is used for reconnaissance** — scanner IPs often run vulnerable software
-5. **The threat is continuous and automated** — no human is manually typing these commands
-6. **False positive investigation is a core SOC skill** — not every alert is malicious; verification and suppression rule writing are essential analyst tasks
+1. Internet-exposed ICS devices are discovered within minutes of deployment
+2. Scanners actively evade detection through proxy chaining and spoofed headers
+3. Port 502 attracts ICS-specific tools, not generic internet scanners
+4. Compromised infrastructure is routinely used for reconnaissance
+5. The threat is continuous, automated, and globally distributed
+6. False positive investigation and suppression rule writing are essential analyst skills
 
 ---
 
 ## Defensive Implications
 
-This lab demonstrates why **air-gapping and network segmentation** are the primary security controls for ICS/OT environments per IEC 62443 and NIST SP 800-82:
-
-- Modbus has no authentication — if an attacker reaches port 502 they can send arbitrary commands
-- Any internet-exposed ICS device will be found and probed within hours
-- The sophistication of observed scanning tools suggests organized, well-resourced threat actors
+This lab demonstrates why air-gapping and network segmentation are the primary security controls for ICS/OT environments per IEC 62443 and NIST SP 800-82. Modbus has no authentication — if an attacker reaches port 502 they can send arbitrary commands to industrial equipment with no credentials required.
 
 ---
 
@@ -584,7 +566,7 @@ This lab demonstrates why **air-gapping and network segmentation** are the prima
 
 ## Related Projects
 
-- [ICS Modbus Homelab](https://github.com/bsuar6/ics-modbus-lab) — Modbus protocol analysis and anomaly detection lab
+- [ICS Modbus Homelab](https://github.com/<your_github_username>/ics-modbus-lab) — Modbus protocol analysis and anomaly detection lab
 
 ---
 
