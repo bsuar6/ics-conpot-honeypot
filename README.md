@@ -1,6 +1,6 @@
 # ICS/OT Conpot Honeypot — Live Threat Intelligence Lab with SIEM Integration
 
-A production ICS honeypot deployed on a public-facing VPS to capture real internet threat actor reconnaissance activity against simulated industrial control systems. Includes a custom Flask monitoring dashboard and a Wazuh SIEM with custom decoders, detection rules, and OpenSearch visualizations.
+A production ICS honeypot deployed on a public-facing VPS to capture real internet threat actor reconnaissance activity against simulated industrial control systems. Includes a custom Flask monitoring dashboard, a Python log enricher, and a Wazuh SIEM with custom decoders, detection rules, and OpenSearch visualizations.
 
 ---
 
@@ -103,9 +103,11 @@ Name: `conpot-firewall`
 | Custom | TCP | 502 | Modbus TCP — fake PLC |
 | Custom | UDP | 161 | SNMP — fake network device |
 | Custom | TCP | 8888 | Flask monitoring dashboard |
-| SSH | TCP | 22 | Management access |
+| SSH | TCP | 22 | Management access — restrict to your IP only |
 
-**Why these ports?**
+**Why restrict SSH to your IP only?** Every public IP on the internet gets hammered with SSH brute force attempts within minutes of being provisioned. Restricting SSH to your IP eliminates this noise from your SIEM logs and removes a real attack surface. Without this restriction your Wazuh dashboard will be flooded with SSH brute force alerts, drowning out the ICS-specific events you actually care about.
+
+**Why these ICS ports?**
 - **502** — Modbus TCP is the most common ICS protocol. Automated scanners specifically target this port looking for exposed PLCs
 - **102** — S7Comm is Siemens-proprietary. Targeting this indicates knowledge of industrial systems
 - **80** — HTTP exposes the fake HMI interface. Attackers look for web-based SCADA panels
@@ -187,6 +189,7 @@ Conpot serves a "Technodrome" HMI web interface on port 80 showing system status
 
 Write Conpot logs to a file for Wazuh ingestion and persistent storage:
 ```bash
+touch /var/log/conpot.log
 docker logs -f conpot >> /var/log/conpot.log 2>&1 &
 ```
 
@@ -202,9 +205,80 @@ Add:
 
 ---
 
-## Part 2 — Flask Monitoring Dashboard
+## Part 2 — Conpot Log Enricher
 
-A custom Python Flask dashboard deployed on the Conpot droplet provides real-time visibility into honeypot activity, auto-refreshing every 30 seconds.
+The `scripts/enrich_conpot.py` script parses raw Conpot logs in real time and converts them into structured JSON events that Wazuh can decode with full field extraction.
+
+### Why Enrichment?
+
+Raw Conpot logs are unstructured text like:
+```
+2026-03-28 22:29:53,426 Modbus traffic from 198.235.24.45: {'request': b'133700000005002b0e0100', 'slave_id': 0, 'function_code': None, 'response': b''}
+```
+
+Wazuh can detect these with basic text matching but can't extract fields like source IP, function code, or raw payload for correlation. The enricher converts them to structured JSON:
+```json
+{
+  "conpot_timestamp": "2026-03-28 22:29:53,426",
+  "event_type": "modbus_traffic",
+  "srcip": "198.235.24.45",
+  "function_code": "None",
+  "raw_request": "133700000005002b0e0100",
+  "severity": "HIGH"
+}
+```
+
+### What It Detects
+
+| Event Type | Description | Severity |
+|------------|-------------|----------|
+| `modbus_traffic` | Modbus packet with function code and raw payload | HIGH/MEDIUM |
+| `modbus_terminated` | Modbus connection closed | LOW |
+| `s7comm_session` | New Siemens S7Comm connection | HIGH |
+| `s7comm_bad_magic` | Non-S7Comm tool probing port 102 | MEDIUM |
+| `http_session` | New HTTP connection to fake HMI | LOW |
+| `http_get_request` | HTTP GET with path and user agent | LOW |
+
+### Notable Finding — Modbus Function Code 43
+
+Multiple scanners sent Modbus Function Code 43 (0x2B) — Read Device Identification. This is not a standard read/write command — it specifically enumerates device metadata: manufacturer name, product name, firmware version. FC43 traffic indicates a scanner with ICS-specific knowledge performing targeted device fingerprinting before deciding how to attack.
+
+Raw request observed: `002b0e0100` — the standard FC43 MEI Type 14 (0x0E) request.
+
+### Running as a Service
+```bash
+nano /etc/systemd/system/conpot-enricher.service
+```
+```ini
+[Unit]
+Description=Conpot Log Enricher
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+User=root
+ExecStart=/usr/bin/python3 /root/enrich_conpot.py
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+systemctl daemon-reload
+systemctl enable conpot-enricher
+systemctl start conpot-enricher
+```
+
+### Important — Timestamp Field Conflict
+
+The enricher uses `conpot_timestamp` instead of `timestamp` for the Conpot event time. This is intentional — OpenSearch's wazuh-alerts index maps `data.timestamp` as a strict ISO 8601 date field. Using Conpot's native timestamp format (`2026-03-28 22:29:53,426`) in a field named `timestamp` causes a `mapper_parsing_exception` and the alert is rejected by the indexer. Renaming to `conpot_timestamp` bypasses this conflict.
+
+---
+
+## Part 3 — Flask Monitoring Dashboard
+
+The `scripts/dashboard.py` Flask dashboard deployed on the Conpot droplet provides real-time visibility into honeypot activity, auto-refreshing every 30 seconds.
 
 ### Installation
 ```bash
@@ -255,11 +329,11 @@ Access at: `http://<HONEYPOT_IP>:8888`
 
 ![HTTP Requests](screenshots/conpot_http_requests.png)
 
-*Recent HTTP requests table. One IP made 11 rapid sequential requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) — a framework-specific scanner that incorrectly fingerprinted the fake ICS HMI as a Node.js web application. This demonstrates how automated tools use technology fingerprinting to select attack modules.*
+*Recent HTTP requests table. One IP made 11 rapid sequential requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) — a framework-specific scanner that incorrectly fingerprinted the fake ICS HMI as a Node.js web application.*
 
 ---
 
-## Part 3 — Wazuh SIEM Integration
+## Part 4 — Wazuh SIEM Integration
 
 ### Why a Separate Droplet for Wazuh?
 
@@ -335,24 +409,20 @@ systemctl start wazuh-agent
 grep "Connected to the server" /var/ossec/logs/ossec.log
 ```
 
-### Step 5 — Configure Conpot Log Ingestion
+### Step 5 — Configure Log Ingestion on Conpot Droplet
 
-Add the Conpot log file as a monitored source on the **Conpot droplet**:
-```bash
-nano /var/ossec/etc/ossec.conf
-```
-
-Add before the last `</ossec_config>` tag:
+Add monitored log sources in `/var/ossec/etc/ossec.conf` before the last `</ossec_config>` tag:
 ```xml
-<localfile>
-  <log_format>full_command</log_format>
-  <command>docker logs --since 60s conpot 2>&1</command>
-  <frequency>60</frequency>
-</localfile>
-
+<!-- Raw Conpot logs -->
 <localfile>
   <log_format>syslog</log_format>
   <location>/var/log/conpot.log</location>
+</localfile>
+
+<!-- Enriched JSON logs from enrich_conpot.py -->
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/conpot_enriched.log</location>
 </localfile>
 ```
 ```bash
@@ -369,17 +439,31 @@ systemctl restart wazuh-manager
 Archives stored at: `/var/ossec/logs/archives/archives.log`
 
 ### Step 7 — Custom Conpot Decoder
+
+On the **Wazuh manager droplet:**
 ```bash
 nano /var/ossec/etc/decoders/conpot_decoders.xml
 ```
 ```xml
 <decoder name="conpot">
-  <prematch>New http session from|HTTP/1.1 GET request from|Session timed out|New modbus session|New s7comm session</prematch>
+  <prematch>New http session from|New modbus session|New s7comm session|New snmp session|New bacnet session|New enip session|New ftp session|HTTP/1.1 GET request from|Session timed out</prematch>
 </decoder>
 
 <decoder name="conpot-http-session">
   <parent>conpot</parent>
   <regex>New http session from (\d+\.\d+\.\d+\.\d+)</regex>
+  <order>srcip</order>
+</decoder>
+
+<decoder name="conpot-modbus">
+  <parent>conpot</parent>
+  <regex>New modbus session from (\d+\.\d+\.\d+\.\d+)</regex>
+  <order>srcip</order>
+</decoder>
+
+<decoder name="conpot-s7comm">
+  <parent>conpot</parent>
+  <regex>New s7comm session from (\d+\.\d+\.\d+\.\d+)</regex>
   <order>srcip</order>
 </decoder>
 
@@ -397,7 +481,7 @@ nano /var/ossec/etc/decoders/conpot_decoders.xml
 
 **Test the decoder:**
 ```bash
-echo "New http session from 159.223.216.61" | /var/ossec/bin/wazuh-logtest
+echo "New modbus session from 1.2.3.4" | /var/ossec/bin/wazuh-logtest
 ```
 
 ### Step 8 — Custom Detection Rules
@@ -407,6 +491,7 @@ nano /var/ossec/etc/rules/conpot_rules.xml
 ```xml
 <group name="conpot,ics,honeypot">
 
+  <!-- Text-based Conpot rules -->
   <rule id="100001" level="5">
     <decoded_as>conpot</decoded_as>
     <match>New http session</match>
@@ -421,11 +506,108 @@ nano /var/ossec/etc/rules/conpot_rules.xml
     <group>conpot,http,ics_recon</group>
   </rule>
 
-  <rule id="100003" level="3">
+  <rule id="100003" level="8">
+    <decoded_as>conpot</decoded_as>
+    <match>New modbus session</match>
+    <description>Conpot: Modbus TCP connection to fake PLC</description>
+    <group>conpot,modbus,ics_attack</group>
+  </rule>
+
+  <rule id="100004" level="10">
+    <decoded_as>conpot</decoded_as>
+    <match>New s7comm session</match>
+    <description>Conpot: S7Comm connection - Siemens PLC targeted</description>
+    <group>conpot,s7comm,ics_attack</group>
+  </rule>
+
+  <rule id="100005" level="6">
+    <decoded_as>conpot</decoded_as>
+    <match>New snmp session</match>
+    <description>Conpot: SNMP enumeration attempt</description>
+    <group>conpot,snmp,ics_recon</group>
+  </rule>
+
+  <rule id="100006" level="6">
+    <decoded_as>conpot</decoded_as>
+    <match>New bacnet session</match>
+    <description>Conpot: BACnet connection - building automation targeted</description>
+    <group>conpot,bacnet,ics_recon</group>
+  </rule>
+
+  <rule id="100007" level="8">
+    <decoded_as>conpot</decoded_as>
+    <match>New enip session</match>
+    <description>Conpot: EtherNet/IP connection - Rockwell PLC targeted</description>
+    <group>conpot,enip,ics_attack</group>
+  </rule>
+
+  <rule id="100008" level="7">
+    <decoded_as>conpot</decoded_as>
+    <match>New ftp session</match>
+    <description>Conpot: FTP connection to fake ICS file system</description>
+    <group>conpot,ftp,ics_recon</group>
+  </rule>
+
+  <rule id="100009" level="3">
     <decoded_as>conpot</decoded_as>
     <match>Session timed out</match>
     <description>Conpot: Session timed out - likely automated scanner</description>
     <group>conpot,scanner</group>
+  </rule>
+
+  <rule id="100010" level="10" frequency="10" timeframe="60">
+    <if_matched_sid>100001</if_matched_sid>
+    <description>Conpot: High frequency HTTP connections - possible automated attack</description>
+    <group>conpot,http,high_frequency</group>
+  </rule>
+
+  <rule id="100011" level="12" frequency="5" timeframe="60">
+    <if_matched_sid>100003</if_matched_sid>
+    <description>Conpot: High frequency Modbus connections - possible ICS attack</description>
+    <group>conpot,modbus,high_frequency,ics_attack</group>
+  </rule>
+
+  <!-- Enriched JSON rules -->
+  <rule id="100020" level="8">
+    <if_sid>86600</if_sid>
+    <field name="event_type">modbus_traffic</field>
+    <description>Conpot: Modbus traffic detected from $(srcip)</description>
+    <group>conpot,modbus,ics_attack</group>
+  </rule>
+
+  <rule id="100021" level="10">
+    <if_sid>100020</if_sid>
+    <field name="function_code">None</field>
+    <description>Conpot: Malformed Modbus packet - possible fuzzer from $(srcip)</description>
+    <group>conpot,modbus,fuzzing,ics_attack</group>
+  </rule>
+
+  <rule id="100022" level="10">
+    <if_sid>86600</if_sid>
+    <field name="event_type">s7comm_session</field>
+    <description>Conpot: S7Comm session - Siemens PLC targeted from $(srcip)</description>
+    <group>conpot,s7comm,ics_attack</group>
+  </rule>
+
+  <rule id="100023" level="7">
+    <if_sid>86600</if_sid>
+    <field name="event_type">s7comm_bad_magic</field>
+    <description>Conpot: Non-S7Comm tool probing port 102 from $(srcip)</description>
+    <group>conpot,s7comm,scanner</group>
+  </rule>
+
+  <rule id="100024" level="6">
+    <if_sid>86600</if_sid>
+    <field name="event_type">http_get_request</field>
+    <description>Conpot: HTTP GET to fake HMI from $(srcip)</description>
+    <group>conpot,http,ics_recon</group>
+  </rule>
+
+  <rule id="100025" level="8">
+    <if_sid>86600</if_sid>
+    <field name="event_type">http_session</field>
+    <description>Conpot: New HTTP session to fake HMI from $(srcip)</description>
+    <group>conpot,http,ics_recon</group>
   </rule>
 
 </group>
@@ -463,7 +645,7 @@ systemctl restart wazuh-manager
 
 ---
 
-## Part 4 — Wazuh OpenSearch Dashboard
+## Part 5 — Wazuh OpenSearch Dashboard
 
 A custom dashboard built in Wazuh's OpenSearch interface provides correlated threat intelligence visualization.
 
@@ -502,55 +684,96 @@ The honeypot received its first connection attempt within 30 minutes of deployme
 
 ### Finding 2 — ICS-Specific Targeting
 
-Connections to ports 502 (Modbus) and 102 (S7Comm) confirm ICS-specific scanning tools are active on the internet. Generic web scanners do not probe these ports — this traffic originates from tools purpose-built to find industrial systems.
+Connections to ports 502 (Modbus) and 102 (S7Comm) confirm ICS-specific scanning tools are active on the internet. Generic web scanners do not probe these ports.
 
 **MITRE ATT&CK for ICS:** T0888 — Remote System Information Discovery
 
-### Finding 3 — Coordinated SSH Credential Stuffing
+### Finding 3 — Modbus Function Code 43 — Device Identification
+
+Multiple scanners sent FC43 (Read Device Identification) — a protocol-aware reconnaissance technique that enumerates manufacturer name, product name, and firmware version from Modbus devices. This is not opportunistic scanning — it requires knowledge of the Modbus MEI extension and indicates targeted ICS reconnaissance tooling.
+
+**MITRE ATT&CK for ICS:** T0888 — Remote System Information Discovery
+
+### Finding 4 — Coordinated SSH Credential Stuffing
 
 A coordinated botnet making SSH brute force attempts every 90 seconds using a rotating wordlist of cryptocurrency-specific usernames: `solana`, `solv`, `validator`, `node`, `evm`, `evmbot`, `trader`, `trading`, `sniper`, `bot`. This is a crypto-targeting botnet scanning for exposed blockchain infrastructure.
 
 **MITRE ATT&CK:** T1110.001 — Password Guessing
 
-### Finding 4 — Proxy-Based Evasion
+### Finding 5 — Proxy-Based Evasion
 ```
 Via: 1.1 muoxy-orange-nyc1-prod (squid/6.13)
 X-Forwarded-For: 127.0.0.1
 User-Agent: Chrome/55 (2016 — spoofed)
 ```
 
-Scanner routing traffic through a Squid proxy chain with spoofed loopback headers to obscure true origin. Indicates sophisticated automated tooling designed to evade attribution.
+Scanner routing traffic through a Squid proxy chain with spoofed loopback headers to obscure true origin.
 
 **MITRE ATT&CK for ICS:** T0883 — Internet Accessible Device
 
-### Finding 5 — Compromised Scanning Infrastructure
+### Finding 6 — Compromised Scanning Infrastructure
 
-A source IP was identified running nginx 1.18.0 with multiple unpatched CVEs including CVE-2023-44487 (HTTP/2 Rapid Reset) and a 2025 CVE — a compromised or rented host being used as scanning infrastructure to hide attacker identity.
+A source IP was identified running nginx 1.18.0 with multiple unpatched CVEs including CVE-2023-44487 (HTTP/2 Rapid Reset) and a 2025 CVE — a compromised or rented host being used as scanning infrastructure.
 
-### Finding 6 — Framework-Specific Scanner Misfiring
+### Finding 7 — Framework-Specific Scanner Misfiring
 
-One IP made 11 rapid requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) against the fake ICS HMI — incorrectly fingerprinting Conpot as a Node.js application and switching to a framework-specific attack module.
+One IP made 11 rapid requests probing Next.js paths (`/_next`, `/api`, `/api/route`, `/app`) against the fake ICS HMI — incorrectly fingerprinting Conpot as a Node.js application.
 
-### Finding 7 — False Positive Investigation
+### Finding 8 — False Positive Investigation
 
 Wazuh rootcheck flagged `/bin/diff` as trojaned (rule 510, level 7). Full forensic investigation confirmed legitimate binary via SHA256 hash verification and package manifest check. Suppression rule written. This demonstrates a core SOC analyst workflow — alert triage, investigation, and noise reduction.
+
+---
+
+## Detection Rule Summary
+
+| Rule ID | Event | Level | MITRE |
+|---------|-------|-------|-------|
+| 100001 | HTTP session | 5 | T0883 |
+| 100002 | HTTP GET request | 5 | T0883 |
+| 100003 | Modbus session | 8 | T0888 |
+| 100004 | S7Comm session | 10 | T0888 |
+| 100005 | SNMP enumeration | 6 | T0888 |
+| 100006 | BACnet connection | 6 | T0888 |
+| 100007 | EtherNet/IP connection | 8 | T0888 |
+| 100008 | FTP connection | 7 | T0888 |
+| 100009 | Session timeout | 3 | — |
+| 100010 | High frequency HTTP | 10 | T0883 |
+| 100011 | High frequency Modbus | 12 | T0855 |
+| 100020 | Modbus traffic (enriched) | 8 | T0888 |
+| 100021 | Malformed Modbus — fuzzer | 10 | T0843 |
+| 100022 | S7Comm session (enriched) | 10 | T0888 |
+| 100023 | S7Comm bad magic | 7 | T0888 |
+| 100024 | HTTP GET (enriched) | 6 | T0883 |
+| 100025 | HTTP session (enriched) | 8 | T0883 |
+| 100100 | False positive suppression | 0 | — |
 
 ---
 
 ## Key Security Findings
 
 1. Internet-exposed ICS devices are discovered within minutes of deployment
-2. Scanners actively evade detection through proxy chaining and spoofed headers
-3. Port 502 attracts ICS-specific tools, not generic internet scanners
-4. Compromised infrastructure is routinely used for reconnaissance
-5. The threat is continuous, automated, and globally distributed
-6. False positive investigation and suppression rule writing are essential analyst skills
+2. ICS-specific scanning tools are actively and continuously sweeping the internet
+3. Modbus FC43 device identification is used for pre-attack reconnaissance
+4. Scanners actively evade detection through proxy chaining and spoofed headers
+5. Compromised infrastructure is routinely used for reconnaissance
+6. The threat is continuous, automated, and globally distributed
+7. False positive investigation and suppression rule writing are essential analyst skills
 
 ---
 
 ## Defensive Implications
 
 This lab demonstrates why air-gapping and network segmentation are the primary security controls for ICS/OT environments per IEC 62443 and NIST SP 800-82. Modbus has no authentication — if an attacker reaches port 502 they can send arbitrary commands to industrial equipment with no credentials required.
+
+---
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/enrich_conpot.py` | Real-time Conpot log enricher — parses raw logs into structured JSON |
+| `scripts/dashboard.py` | Flask web dashboard for live honeypot monitoring |
 
 ---
 
@@ -572,9 +795,9 @@ This lab demonstrates why air-gapping and network segmentation are the primary s
 
 ## Next Steps
 
-- [ ] Parse Conpot logs into structured JSON for deeper analysis
+- [ ] Resolve OpenSearch `data.timestamp` mapping conflict for enriched JSON indexing
 - [ ] Correlate observed scanner IPs against threat intel feeds (AbuseIPDB, OTX)
 - [ ] Add Wazuh active response to auto-block repeat offenders
-- [ ] Extend Conpot decoder to capture Modbus and S7Comm session details
+- [ ] Extend decoder to capture Modbus function codes from raw text logs
 - [ ] Build geolocation heatmap from accumulated attack data
 - [ ] Add DNP3 and EtherNet/IP port monitoring
